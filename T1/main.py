@@ -22,7 +22,6 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 from torch.utils.tensorboard import SummaryWriter
 
-
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -85,7 +84,6 @@ best_acc1 = 0
 
 def main():
     args = parser.parse_args()
-    writer = SummaryWriter('/output/logs')
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -120,13 +118,13 @@ def main():
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
-        main_worker(args.gpu, ngpus_per_node, args, writer)
-
-    writer.close()
+        main_worker(args.gpu, ngpus_per_node, args)
 
 
-def main_worker(gpu, ngpus_per_node, args, writer):
-    global best_acc1
+def main_worker(gpu, ngpus_per_node, args):
+    global best_acc1, checkpoint
+    global writer
+    writer = SummaryWriter(log_dir="/output/logs")
     args.gpu = gpu
 
     if args.gpu is not None:
@@ -148,8 +146,11 @@ def main_worker(gpu, ngpus_per_node, args, writer):
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
-        num_ftrs = model.fc.in_features
-        model.fc = nn.Linear(num_ftrs, 200) 
+
+    #Change the dim of image input
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs,200)
+
 
     if not torch.cuda.is_available() and not torch.backends.mps.is_available():
         print('using CPU, this will be slow')
@@ -274,7 +275,7 @@ def main_worker(gpu, ngpus_per_node, args, writer):
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args, epoch, writer)
+        validate(val_loader, model, criterion, args)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -282,10 +283,15 @@ def main_worker(gpu, ngpus_per_node, args, writer):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device, args, writer)
+        train(train_loader, model, criterion, optimizer, epoch, device, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args, epoch, writer)
+        acc1, acc5, loss = validate(val_loader, model, criterion, args)
+
+        # Log to TensorBoard
+        writer.add_scalar('val/loss', loss, epoch)
+        writer.add_scalar('val/acc1', acc1, epoch)
+        writer.add_scalar('val/acc5', acc5, epoch)
         
         scheduler.step()
         
@@ -302,10 +308,10 @@ def main_worker(gpu, ngpus_per_node, args, writer):
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
-            }, is_best)
+            }, is_best, filename="/output/checkpoint"+str(epoch + 1)+".pth.tar")
 
 
-def train(train_loader, model, criterion, optimizer, epoch, device, args, writer):
+def train(train_loader, model, criterion, optimizer, epoch, device, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -347,17 +353,25 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, writer
         batch_time.update(time.time() - end)
         end = time.time()
 
-        # After calculating the loss and accuracy, add these two lines to write them to tensorboard
-        writer.add_scalar('Training Loss', losses.avg, epoch * len(train_loader) + i)
-        writer.add_scalar('Training Accuracy', top1.avg, epoch * len(train_loader) + i)
+        # log to tensorboard
+        writer.add_scalar('trainBatch/Loss', losses.val, epoch * len(train_loader) + i)
+        writer.add_scalar('trainBatch/Acc@1', top1.val, epoch * len(train_loader) + i)
+        writer.add_scalar('trainBatch/Acc@5', top5.val, epoch * len(train_loader) + i)
+        writer.add_scalar('trainBatch/time', batch_time.val, epoch * len(train_loader) + i)
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
 
+    # log to tensorboard
+    writer.add_scalar('trainEpoch/Loss', losses.avg, epoch)
+    writer.add_scalar('trainEpoch/Acc@1', top1.avg, epoch)
+    writer.add_scalar('trainEpoch/Acc@5', top5.avg, epoch)
+    writer.add_scalar('trainEpoch/time', batch_time.avg, epoch)
 
-def validate(val_loader, model, criterion, args, epoch, writer):
 
-    def run_validate(loader, epoch, writer, base_progress=0):
+def validate(val_loader, model, criterion, args):
+
+    def run_validate(loader, base_progress=0):
         with torch.no_grad():
             end = time.time()
             for i, (images, target) in enumerate(loader):
@@ -384,10 +398,6 @@ def validate(val_loader, model, criterion, args, epoch, writer):
                 batch_time.update(time.time() - end)
                 end = time.time()
 
-                # write the average loss and accuracy to tensorboard
-                writer.add_scalar('Validation Loss', losses.avg, epoch * len(loader) + i)
-                writer.add_scalar('Validation Accuracy', top1.avg, epoch * len(loader) + i)
-
                 if i % args.print_freq == 0:
                     progress.display(i + 1)
 
@@ -403,7 +413,7 @@ def validate(val_loader, model, criterion, args, epoch, writer):
     # switch to evaluate mode
     model.eval()
 
-    run_validate(val_loader, epoch, writer)
+    run_validate(val_loader)
     if args.distributed:
         top1.all_reduce()
         top5.all_reduce()
@@ -418,7 +428,7 @@ def validate(val_loader, model, criterion, args, epoch, writer):
 
     progress.display_summary()
 
-    return top1.avg
+    return top1.avg, top5.avg, losses.avg
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):

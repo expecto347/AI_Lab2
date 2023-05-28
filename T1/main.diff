@@ -1,0 +1,98 @@
+diff --git a/T1/diff.py b/T1/diff.py
+index 59da292..ca12b40 100644
+--- a/T1/diff.py
++++ b/T1/diff.py
+@@ -20,6 +20,7 @@ import torchvision.models as models
+ import torchvision.transforms as transforms
+ from torch.optim.lr_scheduler import StepLR
+ from torch.utils.data import Subset
++from torch.utils.tensorboard import SummaryWriter # 导入tensorboard
+ 
+ model_names = sorted(name for name in models.__dict__
+     if name.islower() and not name.startswith("__")
+@@ -121,7 +122,9 @@ def main():
+ 
+ 
+ def main_worker(gpu, ngpus_per_node, args):
+-    global best_acc1
++    global best_acc1, checkpoint
++    global writer
++    writer = SummaryWriter(log_dir="/output/logs") # 配置tensorboard
+     args.gpu = gpu
+ 
+     if args.gpu is not None:
+@@ -144,6 +147,11 @@ def main_worker(gpu, ngpus_per_node, args):
+         print("=> creating model '{}'".format(args.arch))
+         model = models.__dict__[args.arch]()
+ 
++    #Change the dim of image input
++    num_ftrs = model.fc.in_features
++    model.fc = nn.Linear(num_ftrs,200) # 修改全连接层的输出
++
++
+     if not torch.cuda.is_available() and not torch.backends.mps.is_available():
+         print('using CPU, this will be slow')
+     elif args.distributed:
+@@ -229,7 +237,7 @@ def main_worker(gpu, ngpus_per_node, args):
+         val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
+     else:
+         traindir = os.path.join(args.data, 'train')
+-        valdir = os.path.join(args.data, 'val')
++        valdir = os.path.join(args.data, 'val_reorg') # 修改验证集路径
+         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                      std=[0.229, 0.224, 0.225])
+ 
+@@ -278,7 +286,12 @@ def main_worker(gpu, ngpus_per_node, args):
+         train(train_loader, model, criterion, optimizer, epoch, device, args)
+ 
+         # evaluate on validation set
+-        acc1 = validate(val_loader, model, criterion, args)
++        acc1, acc5, loss = validate(val_loader, model, criterion, args)
++
++        # Log to TensorBoard
++        writer.add_scalar('val/loss', loss, epoch)
++        writer.add_scalar('val/acc1', acc1, epoch)
++        writer.add_scalar('val/acc5', acc5, epoch) # 记录验证集的loss和acc
+         
+         scheduler.step()
+         
+@@ -295,7 +308,7 @@ def main_worker(gpu, ngpus_per_node, args):
+                 'best_acc1': best_acc1,
+                 'optimizer' : optimizer.state_dict(),
+                 'scheduler' : scheduler.state_dict()
+-            }, is_best)
++            }, is_best, filename="/output/checkpoint"+str(epoch + 1)+".pth.tar") # 保存模型，我们希望保存每个模型，所以修改了文件名
+ 
+ 
+ def train(train_loader, model, criterion, optimizer, epoch, device, args):
+@@ -340,9 +353,21 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
+         batch_time.update(time.time() - end)
+         end = time.time()
+ 
++        # log to tensorboard
++        writer.add_scalar('trainBatch/Loss', losses.val, epoch * len(train_loader) + i)
++        writer.add_scalar('trainBatch/Acc@1', top1.val, epoch * len(train_loader) + i)
++        writer.add_scalar('trainBatch/Acc@5', top5.val, epoch * len(train_loader) + i)
++        writer.add_scalar('trainBatch/time', batch_time.val, epoch * len(train_loader) + i) # 记录每个batch的loss和acc
++
+         if i % args.print_freq == 0:
+             progress.display(i + 1)
+ 
++    # log to tensorboard
++    writer.add_scalar('trainEpoch/Loss', losses.avg, epoch)
++    writer.add_scalar('trainEpoch/Acc@1', top1.avg, epoch)
++    writer.add_scalar('trainEpoch/Acc@5', top5.avg, epoch)
++    writer.add_scalar('trainEpoch/time', batch_time.avg, epoch) # 记录每个epoch的loss和acc
++
+ 
+ def validate(val_loader, model, criterion, args):
+ 
+@@ -403,7 +428,7 @@ def validate(val_loader, model, criterion, args):
+ 
+     progress.display_summary()
+ 
+-    return top1.avg
++    return top1.avg, top5.avg, losses.avg # 返回top5的acc和loss
+ 
+ 
+ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
