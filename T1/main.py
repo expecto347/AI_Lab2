@@ -20,6 +20,8 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
+from torch.utils.tensorboard import SummaryWriter
+
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -83,6 +85,7 @@ best_acc1 = 0
 
 def main():
     args = parser.parse_args()
+    writer = SummaryWriter('/output/logs')
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -117,10 +120,12 @@ def main():
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
     else:
         # Simply call main_worker function
-        main_worker(args.gpu, ngpus_per_node, args)
+        main_worker(args.gpu, ngpus_per_node, args, writer)
+
+    writer.close()
 
 
-def main_worker(gpu, ngpus_per_node, args):
+def main_worker(gpu, ngpus_per_node, args, writer):
     global best_acc1
     args.gpu = gpu
 
@@ -143,6 +148,8 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Linear(num_ftrs, 200) 
 
     if not torch.cuda.is_available() and not torch.backends.mps.is_available():
         print('using CPU, this will be slow')
@@ -229,7 +236,7 @@ def main_worker(gpu, ngpus_per_node, args):
         val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
     else:
         traindir = os.path.join(args.data, 'train')
-        valdir = os.path.join(args.data, 'val')
+        valdir = os.path.join(args.data, 'val_reorg')
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
@@ -267,7 +274,7 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion, args, epoch, writer)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -275,10 +282,10 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device, args)
+        train(train_loader, model, criterion, optimizer, epoch, device, args, writer)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, args, epoch, writer)
         
         scheduler.step()
         
@@ -298,7 +305,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, device, args):
+def train(train_loader, model, criterion, optimizer, epoch, device, args, writer):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -340,13 +347,17 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         batch_time.update(time.time() - end)
         end = time.time()
 
+        # After calculating the loss and accuracy, add these two lines to write them to tensorboard
+        writer.add_scalar('Training Loss', losses.avg, epoch * len(train_loader) + i)
+        writer.add_scalar('Training Accuracy', top1.avg, epoch * len(train_loader) + i)
+
         if i % args.print_freq == 0:
             progress.display(i + 1)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, epoch, writer):
 
-    def run_validate(loader, base_progress=0):
+    def run_validate(loader, epoch, writer, base_progress=0):
         with torch.no_grad():
             end = time.time()
             for i, (images, target) in enumerate(loader):
@@ -373,6 +384,10 @@ def validate(val_loader, model, criterion, args):
                 batch_time.update(time.time() - end)
                 end = time.time()
 
+                # write the average loss and accuracy to tensorboard
+                writer.add_scalar('Validation Loss', losses.avg, epoch * len(loader) + i)
+                writer.add_scalar('Validation Accuracy', top1.avg, epoch * len(loader) + i)
+
                 if i % args.print_freq == 0:
                     progress.display(i + 1)
 
@@ -388,7 +403,7 @@ def validate(val_loader, model, criterion, args):
     # switch to evaluate mode
     model.eval()
 
-    run_validate(val_loader)
+    run_validate(val_loader, epoch, writer)
     if args.distributed:
         top1.all_reduce()
         top5.all_reduce()
